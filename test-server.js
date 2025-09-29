@@ -1,8 +1,10 @@
+// Load environment variables
+require('dotenv').config();
 const http = require('http');
 
 // Test the server endpoints
 async function testServer() {
-  const baseUrl = 'http://localhost:3000';
+  const baseUrl = `http://localhost:${process.env.PORT || 3000}`;
   
   try {
     // Test health endpoint
