@@ -43,15 +43,7 @@ createDatabaseConnection().then(connection => {
 // Initialize database tables
 async function initializeDatabase() {
   try {
-    // Create services table
-    await db.execute(`
-      CREATE TABLE IF NOT EXISTS services (
-        id VARCHAR(50) PRIMARY KEY,
-        name VARCHAR(100) NOT NULL
-      )
-    `);
-    
-    // Create tokens table
+    // Create tokens table with correct schema matching existing data
     await db.execute(`
       CREATE TABLE IF NOT EXISTS tokens (
         token VARCHAR(10) PRIMARY KEY,
@@ -61,8 +53,7 @@ async function initializeDatabase() {
         position INT NOT NULL,
         estimated_wait INT NOT NULL,
         timestamp DATETIME NOT NULL,
-        status ENUM('waiting', 'serving', 'completed', 'cancelled') DEFAULT 'waiting',
-        FOREIGN KEY (service_id) REFERENCES services(id)
+        status ENUM('waiting', 'serving', 'completed', 'cancelled') DEFAULT 'waiting'
       )
     `);
     
@@ -77,9 +68,17 @@ function generateToken() {
   return Math.random().toString(36).substring(2, 8).toUpperCase();
 }
 
-// Helper function to get current timestamp
+// Helper function to get current timestamp in MySQL DATETIME format
 function getCurrentTimestamp() {
-  return new Date().toISOString();
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  const hours = String(now.getHours()).padStart(2, '0');
+  const minutes = String(now.getMinutes()).padStart(2, '0');
+  const seconds = String(now.getSeconds()).padStart(2, '0');
+  
+  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
 }
 
 // Endpoint to generate a new token
@@ -93,20 +92,13 @@ app.post('/generate-token', async (req, res) => {
       });
     }
     
-    // Insert service if it doesn't exist
-    try {
-      await db.execute(
-        'INSERT IGNORE INTO services (id, name) VALUES (?, ?)',
-        [serviceId, serviceName]
-      );
-    } catch (error) {
-      console.error('Error inserting service:', error);
-    }
-    
     // Generate unique token
     let token;
     let isUnique = false;
-    while (!isUnique) {
+    let attempts = 0;
+    const maxAttempts = 100; // Increase attempts
+    
+    while (!isUnique && attempts < maxAttempts) {
       token = generateToken();
       try {
         const [rows] = await db.execute(
@@ -118,6 +110,11 @@ app.post('/generate-token', async (req, res) => {
         console.error('Error checking token uniqueness:', error);
         break;
       }
+      attempts++;
+    }
+    
+    if (!isUnique) {
+      return res.status(500).json({ error: 'Unable to generate unique token after ' + maxAttempts + ' attempts' });
     }
     
     // Get position in queue
@@ -184,7 +181,15 @@ app.get('/queue/:serviceId', async (req, res) => {
     );
     
     if (serviceRows.length === 0) {
-      return res.status(404).json({ error: 'Service not found' });
+      // Also check by name if not found by ID
+      const [serviceRowsByName] = await db.execute(
+        'SELECT id FROM services WHERE name = ?',
+        [serviceId]
+      );
+      
+      if (serviceRowsByName.length === 0) {
+        return res.status(404).json({ error: 'Service not found' });
+      }
     }
     
     // Get tokens in queue
@@ -216,7 +221,15 @@ app.post('/call-next/:serviceId', async (req, res) => {
     );
     
     if (serviceRows.length === 0) {
-      return res.status(404).json({ error: 'Service not found' });
+      // Also check by name if not found by ID
+      const [serviceRowsByName] = await db.execute(
+        'SELECT id FROM services WHERE name = ?',
+        [serviceId]
+      );
+      
+      if (serviceRowsByName.length === 0) {
+        return res.status(404).json({ error: 'Service not found' });
+      }
     }
     
     // Get the first token in queue
