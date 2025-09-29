@@ -1,6 +1,9 @@
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
+const mysql = require('mysql2/promise');
+// Load environment variables
+require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -9,9 +12,65 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(bodyParser.json());
 
-// In-memory storage for tokens and queues
-const queues = new Map(); // serviceId -> queue array
-const tokens = new Map(); // token -> tokenInfo
+// Database connection configuration
+async function createDatabaseConnection() {
+  try {
+    const connection = await mysql.createConnection({
+      host: process.env.DB_HOST || 'caboose.proxy.rlwy.net',
+      port: process.env.DB_PORT || 50200,
+      user: process.env.DB_USER || 'root',
+      password: process.env.DB_PASSWORD || 'qZfQILPCSaOTJVgSCQFsLaxDqosKrVPt',
+      database: process.env.DB_NAME || 'railway'
+    });
+    
+    console.log('Database connected successfully');
+    return connection;
+  } catch (error) {
+    console.error('Error connecting to database:', error);
+    process.exit(1);
+  }
+}
+
+// Create database connection
+let db;
+createDatabaseConnection().then(connection => {
+  db = connection;
+  
+  // Create tables if they don't exist
+  initializeDatabase();
+});
+
+// Initialize database tables
+async function initializeDatabase() {
+  try {
+    // Create services table
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS services (
+        id VARCHAR(50) PRIMARY KEY,
+        name VARCHAR(100) NOT NULL
+      )
+    `);
+    
+    // Create tokens table
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS tokens (
+        token VARCHAR(10) PRIMARY KEY,
+        service_id VARCHAR(50) NOT NULL,
+        service_name VARCHAR(100) NOT NULL,
+        user_id VARCHAR(50) NOT NULL,
+        position INT NOT NULL,
+        estimated_wait INT NOT NULL,
+        timestamp DATETIME NOT NULL,
+        status ENUM('waiting', 'serving', 'completed', 'cancelled') DEFAULT 'waiting',
+        FOREIGN KEY (service_id) REFERENCES services(id)
+      )
+    `);
+    
+    console.log('Database tables initialized successfully');
+  } catch (error) {
+    console.error('Error initializing database:', error);
+  }
+}
 
 // Helper function to generate a random token
 function generateToken() {
@@ -24,7 +83,7 @@ function getCurrentTimestamp() {
 }
 
 // Endpoint to generate a new token
-app.post('/generate-token', (req, res) => {
+app.post('/generate-token', async (req, res) => {
   try {
     const { serviceId, serviceName, userId } = req.body;
     
@@ -34,38 +93,49 @@ app.post('/generate-token', (req, res) => {
       });
     }
     
-    // Create queue for service if it doesn't exist
-    if (!queues.has(serviceId)) {
-      queues.set(serviceId, []);
+    // Insert service if it doesn't exist
+    try {
+      await db.execute(
+        'INSERT IGNORE INTO services (id, name) VALUES (?, ?)',
+        [serviceId, serviceName]
+      );
+    } catch (error) {
+      console.error('Error inserting service:', error);
     }
     
     // Generate unique token
     let token;
-    do {
+    let isUnique = false;
+    while (!isUnique) {
       token = generateToken();
-    } while (tokens.has(token));
+      try {
+        const [rows] = await db.execute(
+          'SELECT token FROM tokens WHERE token = ?',
+          [token]
+        );
+        isUnique = rows.length === 0;
+      } catch (error) {
+        console.error('Error checking token uniqueness:', error);
+        break;
+      }
+    }
     
     // Get position in queue
-    const queue = queues.get(serviceId);
-    const position = queue.length + 1;
+    const [queueRows] = await db.execute(
+      'SELECT COUNT(*) as count FROM tokens WHERE service_id = ? AND status = ?',
+      [serviceId, 'waiting']
+    );
+    const position = queueRows[0].count + 1;
     
     // Estimated wait time (simplified calculation)
     const estimatedWait = position * 5; // 5 minutes per person
     
-    // Store token information
-    const tokenInfo = {
-      token,
-      serviceId,
-      serviceName,
-      userId,
-      position,
-      estimatedWait,
-      timestamp: getCurrentTimestamp(),
-      status: 'waiting'
-    };
-    
-    tokens.set(token, tokenInfo);
-    queue.push(tokenInfo);
+    // Insert token information
+    const timestamp = getCurrentTimestamp();
+    await db.execute(
+      'INSERT INTO tokens (token, service_id, service_name, user_id, position, estimated_wait, timestamp, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [token, serviceId, serviceName, userId, position, estimatedWait, timestamp, 'waiting']
+    );
     
     // Return token information
     res.json({
@@ -73,7 +143,7 @@ app.post('/generate-token', (req, res) => {
       position,
       estimatedWait,
       serviceName,
-      timestamp: tokenInfo.timestamp
+      timestamp
     });
   } catch (error) {
     console.error('Error generating token:', error);
@@ -82,16 +152,20 @@ app.post('/generate-token', (req, res) => {
 });
 
 // Endpoint to get token status
-app.get('/token/:token', (req, res) => {
+app.get('/token/:token', async (req, res) => {
   try {
     const { token } = req.params;
     
-    if (!tokens.has(token)) {
+    const [rows] = await db.execute(
+      'SELECT * FROM tokens WHERE token = ?',
+      [token]
+    );
+    
+    if (rows.length === 0) {
       return res.status(404).json({ error: 'Token not found' });
     }
     
-    const tokenInfo = tokens.get(token);
-    res.json(tokenInfo);
+    res.json(rows[0]);
   } catch (error) {
     console.error('Error fetching token:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -99,24 +173,30 @@ app.get('/token/:token', (req, res) => {
 });
 
 // Endpoint to get queue status for a service
-app.get('/queue/:serviceId', (req, res) => {
+app.get('/queue/:serviceId', async (req, res) => {
   try {
     const { serviceId } = req.params;
     
-    if (!queues.has(serviceId)) {
+    // Check if service exists
+    const [serviceRows] = await db.execute(
+      'SELECT id FROM services WHERE id = ?',
+      [serviceId]
+    );
+    
+    if (serviceRows.length === 0) {
       return res.status(404).json({ error: 'Service not found' });
     }
     
-    const queue = queues.get(serviceId);
+    // Get tokens in queue
+    const [tokenRows] = await db.execute(
+      'SELECT token, position, estimated_wait, timestamp FROM tokens WHERE service_id = ? AND status = ? ORDER BY position',
+      [serviceId, 'waiting']
+    );
+    
     res.json({
       serviceId,
-      queueLength: queue.length,
-      tokens: queue.map(token => ({
-        token: token.token,
-        position: token.position,
-        estimatedWait: token.estimatedWait,
-        timestamp: token.timestamp
-      }))
+      queueLength: tokenRows.length,
+      tokens: tokenRows
     });
   } catch (error) {
     console.error('Error fetching queue:', error);
@@ -125,37 +205,50 @@ app.get('/queue/:serviceId', (req, res) => {
 });
 
 // Endpoint to call next token (for staff)
-app.post('/call-next/:serviceId', (req, res) => {
+app.post('/call-next/:serviceId', async (req, res) => {
   try {
     const { serviceId } = req.params;
     
-    if (!queues.has(serviceId)) {
+    // Check if service exists
+    const [serviceRows] = await db.execute(
+      'SELECT id FROM services WHERE id = ?',
+      [serviceId]
+    );
+    
+    if (serviceRows.length === 0) {
       return res.status(404).json({ error: 'Service not found' });
     }
     
-    const queue = queues.get(serviceId);
+    // Get the first token in queue
+    const [tokenRows] = await db.execute(
+      'SELECT * FROM tokens WHERE service_id = ? AND status = ? ORDER BY position LIMIT 1',
+      [serviceId, 'waiting']
+    );
     
-    if (queue.length === 0) {
+    if (tokenRows.length === 0) {
       return res.status(404).json({ error: 'No tokens in queue' });
     }
     
-    // Get the first token in queue
-    const currentToken = queue.shift();
+    const currentToken = tokenRows[0];
     
     // Update token status
-    currentToken.status = 'serving';
-    tokens.set(currentToken.token, currentToken);
+    await db.execute(
+      'UPDATE tokens SET status = ? WHERE token = ?',
+      ['serving', currentToken.token]
+    );
     
     // Update positions for remaining tokens
-    queue.forEach((token, index) => {
-      token.position = index + 1;
-      token.estimatedWait = token.position * 5;
-      tokens.set(token.token, token);
-    });
+    await db.execute(
+      'UPDATE tokens SET position = position - 1, estimated_wait = (position - 1) * 5 WHERE service_id = ? AND status = ? AND position > ?',
+      [serviceId, 'waiting', currentToken.position]
+    );
     
     res.json({
       calledToken: currentToken.token,
-      remainingQueueLength: queue.length
+      remainingQueueLength: (await db.execute(
+        'SELECT COUNT(*) as count FROM tokens WHERE service_id = ? AND status = ?',
+        [serviceId, 'waiting']
+      ))[0][0].count
     });
   } catch (error) {
     console.error('Error calling next token:', error);
@@ -164,32 +257,33 @@ app.post('/call-next/:serviceId', (req, res) => {
 });
 
 // Endpoint to cancel a token
-app.post('/cancel-token/:token', (req, res) => {
+app.post('/cancel-token/:token', async (req, res) => {
   try {
     const { token } = req.params;
     
-    if (!tokens.has(token)) {
+    // Get token info
+    const [tokenRows] = await db.execute(
+      'SELECT * FROM tokens WHERE token = ?',
+      [token]
+    );
+    
+    if (tokenRows.length === 0) {
       return res.status(404).json({ error: 'Token not found' });
     }
     
-    const tokenInfo = tokens.get(token);
-    const queue = queues.get(tokenInfo.serviceId);
+    const tokenInfo = tokenRows[0];
     
-    // Remove token from queue
-    const index = queue.findIndex(t => t.token === token);
-    if (index !== -1) {
-      queue.splice(index, 1);
-      
-      // Update positions for remaining tokens
-      for (let i = index; i < queue.length; i++) {
-        queue[i].position = i + 1;
-        queue[i].estimatedWait = queue[i].position * 5;
-        tokens.set(queue[i].token, queue[i]);
-      }
-    }
+    // Update token status
+    await db.execute(
+      'UPDATE tokens SET status = ? WHERE token = ?',
+      ['cancelled', token]
+    );
     
-    // Remove token from tokens map
-    tokens.delete(token);
+    // Update positions for remaining tokens
+    await db.execute(
+      'UPDATE tokens SET position = position - 1, estimated_wait = (position - 1) * 5 WHERE service_id = ? AND status = ? AND position > ?',
+      [tokenInfo.service_id, 'waiting', tokenInfo.position]
+    );
     
     res.json({ message: 'Token cancelled successfully' });
   } catch (error) {
