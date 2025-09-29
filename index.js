@@ -169,6 +169,23 @@ app.get('/token/:token', async (req, res) => {
   }
 });
 
+// Endpoint to get user history
+app.get('/tokens/user/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    const [rows] = await db.execute(
+      'SELECT token, service_name, position, timestamp, status FROM tokens WHERE user_id = ? ORDER BY timestamp DESC',
+      [userId]
+    );
+    
+    res.json(rows);
+  } catch (error) {
+    console.error('Error fetching user history:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Endpoint to get queue status for a service
 app.get('/queue/:serviceId', async (req, res) => {
   try {
